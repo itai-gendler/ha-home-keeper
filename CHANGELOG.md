@@ -6,6 +6,14 @@ All notable changes to Home Keeper are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses semantic
 versioning, with PEP 440 pre-release suffixes (`bN`/`aN`/`rcN`) for betas.
 
+## [0.31.0b2]
+
+### Fixed
+
+- **Card device chip link.** On the dashboard card, the device chip on a task is now a
+  link for an admin, as it is in the panel. It opens the appliance page, else the device
+  page. (Fixes #446)
+
 ## [0.31.0b1]
 
 ### Added
