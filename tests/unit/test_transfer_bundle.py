@@ -148,8 +148,18 @@ def test_merge_keeps_the_report_keys_and_adds_sections():
     merged = tr.merge_reports(
         report, sections={"dogs": {"ok": True}}, problems=[warning]
     )
-    assert set(merged) == {"ok", "dry_run", "counts", "records", "problems", "sections"}
+    assert set(merged) == {
+        "ok",
+        "dry_run",
+        "partial",
+        "counts",
+        "records",
+        "problems",
+        "sections",
+    }
     assert merged["ok"] is True
+    assert merged["partial"] is False
+    assert tr.merge_reports({**report, "partial": True}, sections={})["partial"] is True
     assert merged["sections"] == {"dogs": {"ok": True}}
     assert merged["problems"] == [warning.as_dict()]
     error = tr.Problem("dogs", None, "dogs.x", "bad")
@@ -422,7 +432,12 @@ def test_plan_files_keeps_a_file_that_the_record_has():
         (
             {"kind": "document", "appliance": "nope", "path": "files/home_keeper/a"},
             "appliance",
-            "is not a appliance",
+            '"nope" is not an appliance in this import',
+        ),
+        (
+            {"kind": "task_photo", "task": "nope", "path": "files/home_keeper/a"},
+            "task",
+            '"nope" is not a task in this import',
         ),
         (
             {"kind": "document", "appliance": "asset-1", "path": "files/home_keeper/a"},
@@ -551,3 +566,239 @@ def test_skipped_settings_are_named():
     problems = tb.settings_skipped({"options": {}, "profiles": []})
     assert [p.path for p in problems] == ["profiles", "options"]
     assert all(p.severity == "warning" for p in problems)
+
+
+# ── A zip file that the zipfile module cannot read ───────────────────────────
+
+
+def _patch_method(path: Path, method: int) -> None:
+    """Set the compression method of the first entry in both headers."""
+    data = bytearray(path.read_bytes())
+    data[8:10] = method.to_bytes(2, "little")
+    at = data.index(b"PK\x01\x02") + 10
+    data[at : at + 2] = method.to_bytes(2, "little")
+    path.write_bytes(bytes(data))
+
+
+def test_an_unsupported_compression_method_is_a_bundle_error(tmp_path):
+    path = tmp_path / "deflate64.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("home_keeper.yaml", "home_keeper: {}\n")
+    _patch_method(path, 9)  # Deflate64: zipfile raises NotImplementedError
+    with pytest.raises(tb.BundleError, match="cannot be read"):
+        tb.safe_extract(path, tmp_path / "out")
+
+
+def test_a_corrupt_deflate_stream_is_a_bundle_error(tmp_path):
+    path = _zip(
+        tmp_path / "corrupt.zip", {"home_keeper.yaml": b"home_keeper: {}\n" * 40}
+    )
+    data = bytearray(path.read_bytes())
+    # The compressed data starts after the 30-byte local header and the name.
+    start = 30 + len("home_keeper.yaml")
+    data[start] = 0xFF  # an invalid deflate block type: zlib.error
+    path.write_bytes(bytes(data))
+    with pytest.raises(tb.BundleError, match="cannot be read"):
+        tb.safe_extract(path, tmp_path / "out")
+
+
+def test_a_bad_utf8_entry_name_is_a_bundle_error(tmp_path):
+    path = _zip(tmp_path / "name.zip", {"home_keeper.yaml": b"x", "files/ab": b"x"})
+    data = bytearray(path.read_bytes())
+    for signature, flag_at, name_at in ((b"PK\x03\x04", 6, 30), (b"PK\x01\x02", 8, 46)):
+        start = data.index(signature, data.index(signature) + 1)
+        data[start + flag_at + 1] |= 0x08  # bit 11: the name is UTF-8
+        data[start + name_at + 6] = 0xFF  # "files/ab" -> "files/\xffb"
+    path.write_bytes(bytes(data))
+    with pytest.raises(tb.BundleError, match="not a zip file"):
+        tb.safe_extract(path, tmp_path / "out")
+
+
+# ── Settings: refused option values and profile ids ──────────────────────────
+
+
+_ALL_KEYS = (
+    "profiles",
+    "notifications",
+    "allow_snooze",
+    "one_off_retention_days",
+    "due_time",
+    "due_time_mode",
+    "problem_sensor_exclude_entities",
+)
+
+
+def test_a_refused_option_value_is_a_warning_and_is_not_counted():
+    current = {
+        "allow_snooze": True,
+        "one_off_retention_days": 7,
+        "due_time": "08:00",
+        "due_time_mode": "completion",
+        "problem_sensor_exclude_entities": [],
+    }
+    plan = tb.plan_settings(
+        {
+            "options": {
+                "allow_snooze": "maybe",
+                "one_off_retention_days": "abc",
+                "due_time": "25:99",
+                "due_time_mode": "bogus",
+                "problem_sensor_exclude_entities": "sensor.abc",
+            }
+        },
+        current=current,
+        option_keys=_ALL_KEYS,
+        notify_services=set(),
+        entity_ids=set(),
+    )
+    assert [(p.path, p.severity) for p in plan.problems] == [
+        ("options.allow_snooze", "warning"),
+        ("options.one_off_retention_days", "warning"),
+        ("options.due_time", "warning"),
+        ("options.due_time_mode", "warning"),
+        ("options.problem_sensor_exclude_entities", "warning"),
+    ]
+    assert all("not a valid value" in p.message for p in plan.problems)
+    assert plan.updates == {}
+    assert plan.counts == {"options": {"changed": 0}}
+
+
+def test_only_a_value_that_really_changes_is_counted():
+    plan = tb.plan_settings(
+        {"options": {"due_time": "8:00", "one_off_retention_days": 30}},
+        current={"due_time": "08:00", "one_off_retention_days": 7},
+        option_keys=_ALL_KEYS,
+        notify_services=set(),
+        entity_ids=set(),
+    )
+    assert plan.problems == ()
+    assert plan.updates == {"due_time": "8:00", "one_off_retention_days": 30}
+    assert plan.counts == {"options": {"changed": 1}}
+
+
+def test_a_notification_follows_a_profile_that_matched_by_name():
+    current = {"profiles": [{"id": "local", "name": "Kitchen"}], "notifications": []}
+    plan = _settings(
+        {
+            "profiles": [
+                {"id": "source", "name": "Kitchen"},
+                {"id": "new", "name": "Attic"},
+            ],
+            "notifications": [
+                {"name": "A", "profile_id": "source"},
+                {"name": "B", "profile_id": "new"},
+                {"name": "C", "profile_id": None},
+                {"name": "D", "profile_id": ["source"]},
+            ],
+        },
+        current,
+    )
+    assert plan.problems == ()
+    assert [p["id"] for p in plan.updates["profiles"]] == ["local", "new"]
+    assert [n["profile_id"] for n in plan.updates["notifications"]] == [
+        "local",
+        "new",
+        None,
+        ["source"],
+    ]
+
+
+def test_an_entry_that_needs_a_newer_zip_version_is_a_bundle_error(tmp_path):
+    path = _zip(tmp_path / "version.zip", {"home_keeper.yaml": b"x"})
+    data = bytearray(path.read_bytes())
+    at = data.index(b"PK\x01\x02") + 6  # "version needed to extract"
+    data[at] = 160  # 16.0: zipfile raises NotImplementedError
+    path.write_bytes(bytes(data))
+    with pytest.raises(tb.BundleError, match="not a zip file"):
+        tb.safe_extract(path, tmp_path / "out")
+
+
+def test_a_target_that_home_keeper_does_not_send_to_says_it_is_dropped():
+    plan = _settings(
+        {"notifications": [{"name": "N", "targets": ["nope", "mobile_app_x"]}]}
+    )
+    assert [(p.path, p.message) for p in plan.problems] == [
+        (
+            "notifications[0].targets[0]",
+            'Home Keeper does not send to the notify service "notify.nope", '
+            "so it was not imported",
+        ),
+        (
+            "notifications[0].targets[1]",
+            'the notify service "notify.mobile_app_x" is not on this install',
+        ),
+    ]
+
+
+# ── Settings: profile filter ids from another install ────────────────────────
+
+
+def _known(areas=(), labels=(), devices=()):
+    return tb.RegistryIds(areas=set(areas), labels=set(labels), devices=set(devices))
+
+
+def test_a_profile_filter_id_that_is_not_on_this_install_is_a_warning():
+    profile = {
+        "id": "p1",
+        "name": "Kitchen",
+        "filter": {
+            "areas": ["kitchen", "gone_area"],
+            "exclude_areas": ["old_attic"],
+            "labels": ["lbl_ok", "lbl_gone", "lbl_gone2"],
+            "exclude_labels": [],
+            "devices": ["dev_gone"],
+            "exclude_devices": ["dev_ok"],
+            "companions": ["pawsistant"],
+        },
+    }
+    plan = tb.plan_settings(
+        {"profiles": [profile]},
+        current={},
+        option_keys=("profiles",),
+        notify_services=set(),
+        entity_ids=set(),
+        registry_ids=_known(areas=["kitchen"], labels=["lbl_ok"], devices=["dev_ok"]),
+    )
+    assert [(p.path, p.severity) for p in plan.problems] == [
+        ("profiles[0].filter.areas", "warning"),
+        ("profiles[0].filter.exclude_areas", "warning"),
+        ("profiles[0].filter.labels", "warning"),
+        ("profiles[0].filter.devices", "warning"),
+    ]
+    assert {(p.section, p.index) for p in plan.problems} == {("profiles", 0)}
+    messages = [p.message for p in plan.problems]
+    assert messages[0] == 'the area "gone_area" is not on this install'
+    assert messages[1] == 'the area "old_attic" is not on this install'
+    assert messages[2] == 'the labels "lbl_gone", "lbl_gone2" are not on this install'
+    assert messages[3] == 'the device "dev_gone" is not on this install'
+    # The ids stay: the import warns only.
+    assert plan.updates["profiles"][0]["filter"] == profile["filter"]
+
+
+def test_profile_filter_ids_that_are_on_this_install_give_no_warning():
+    plan = tb.plan_settings(
+        {
+            "profiles": [
+                {"name": "A", "filter": {"areas": ["a"], "exclude_labels": ["l"]}},
+                {"name": "B", "filter": "bad"},
+                {"name": "C", "filter": {"devices": "dev_x", "labels": [None, "", 3]}},
+                "not a profile",
+                {"name": "D", "filter": {"areas": ["gone"]}},
+            ]
+        },
+        current={},
+        option_keys=("profiles",),
+        notify_services=set(),
+        entity_ids=set(),
+        registry_ids=_known(areas=["a"], labels=["l", "3"]),
+    )
+    assert [(p.path, p.severity) for p in plan.problems] == [
+        ("profiles[3]", "error"),
+        ("profiles[4].filter.areas", "warning"),
+    ]
+    assert plan.problems[1].index == 4
+
+
+def test_profile_filter_ids_are_not_checked_without_registry_ids():
+    plan = _settings({"profiles": [{"name": "A", "filter": {"areas": ["gone"]}}]})
+    assert plan.problems == ()

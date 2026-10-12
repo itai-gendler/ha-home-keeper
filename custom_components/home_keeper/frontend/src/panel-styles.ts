@@ -2459,8 +2459,15 @@ export const STYLES = `
   }
   .hk-label-qr { flex: none; width: 120px; height: 120px; }
   .hk-label-qr svg { display: block; width: 100%; height: 100%; }
-  .hk-label-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; color: var(--hk-ink-2); }
+  .hk-label-text {
+    min-width: 0; display: flex; flex-direction: column; gap: 2px; color: var(--hk-ink-2);
+    overflow-wrap: anywhere;
+  }
   .hk-label-text .hk-label-l1 { color: var(--hk-ink); font-weight: 500; font-size: 1.05rem; }
+  /* The preview follows the layout of the print (qr-labels.labelFitMode). */
+  .hk-label-preview[data-fit="below"] { flex-direction: column; text-align: center; }
+  .hk-label-preview[data-fit="code"] { justify-content: center; }
+  .hk-label-preview[data-fit="code"] .hk-label-text { display: none; }
   .hk-label-field { display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem; color: var(--hk-ink-2); }
   .hk-label-field input, .hk-label-field select {
     min-height: var(--hk-tap); box-sizing: border-box; padding: 0 10px; font: inherit; font-size: 16px;

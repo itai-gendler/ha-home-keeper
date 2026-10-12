@@ -20,12 +20,13 @@ import os
 import shutil
 import stat
 import zipfile
+import zlib
 from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import documents, task_photos
+from . import documents, notifications, options, task_photos
 from .const import (
     BUNDLE_DOCUMENT_NAME,
     BUNDLE_FILES_DIR,
@@ -106,7 +107,14 @@ def safe_extract(
     """
     try:
         archive = zipfile.ZipFile(zip_path)
-    except (zipfile.BadZipFile, OSError) as err:
+    # A name that is marked UTF-8 but is not UTF-8 is UnicodeDecodeError, and an
+    # entry that needs a newer zip version is NotImplementedError.
+    except (
+        zipfile.BadZipFile,
+        OSError,
+        UnicodeDecodeError,
+        NotImplementedError,
+    ) as err:
         raise BundleError(
             "the file is not a zip file that Home Keeper can read"
         ) from err
@@ -149,7 +157,16 @@ def safe_extract(
                         sink.write(chunk)
             except BundleError:
                 raise
-            except (zipfile.BadZipFile, EOFError, ValueError, OSError) as err:
+            # An unsupported compression method (Deflate64) is NotImplementedError,
+            # and a corrupt deflate stream is zlib.error.
+            except (
+                zipfile.BadZipFile,
+                EOFError,
+                ValueError,
+                OSError,
+                NotImplementedError,
+                zlib.error,
+            ) as err:
                 raise BundleError(
                     f'the bundle entry "{info.filename}" cannot be read'
                 ) from err
@@ -455,9 +472,10 @@ def plan_files(
             )
             continue
         if kind == "task_photo":
-            owner_key, ids, find = "task", task_ids, find_task
+            owner_key, noun, ids, find = "task", "a task", task_ids, find_task
         else:
-            owner_key, ids, find = "appliance", appliance_ids, find_asset
+            owner_key, noun = "appliance", "an appliance"
+            ids, find = appliance_ids, find_asset
         stated = str(entry.get(owner_key) or "")
         owner_id = ids.get(stated, stated)
         owner = find(owner_id) if owner_id else None
@@ -466,8 +484,7 @@ def plan_files(
                 _file_warning(
                     index,
                     owner_key,
-                    f'"{stated}" is not a {owner_key} in this import or on this '
-                    "install",
+                    f'"{stated}" is not {noun} in this import or on this install',
                 )
             )
             continue
@@ -534,12 +551,15 @@ def _upsert(
     raw: Any,
     current: list[dict[str, Any]],
     problems: list[Problem],
+    ids: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]] | None, dict[str, int]]:
     """Merge the records of a profiles or notifications section onto *current*.
 
     A record matches a stored record by ``id``, then by ``name``. A match replaces
     the stored record, and a record that matches none is added. A stored record that
-    the section does not name stays.
+    the section does not name stays. A record that matches by name keeps the stored
+    ``id``. If *ids* is a dict, it gets the imported id and the stored id of each
+    such record.
     """
     counts = {"created": 0, "updated": 0}
     if not isinstance(raw, list):
@@ -581,9 +601,84 @@ def _upsert(
             merged.append(dict(record))
             counts["created"] += 1
         else:
-            merged[position] = {**dict(record), "id": merged[position].get("id")}
+            stored_id = merged[position].get("id")
+            if ids is not None and record.get("id") and stored_id:
+                ids[str(record["id"])] = str(stored_id)
+            merged[position] = {**dict(record), "id": stored_id}
             counts["updated"] += 1
     return merged, counts
+
+
+@dataclass(frozen=True, slots=True)
+class RegistryIds:
+    """The area, label and device ids of this install. ``in`` answers for each."""
+
+    areas: Container[str]
+    labels: Container[str]
+    devices: Container[str]
+
+
+# The registry id lists of a profile filter (``profiles.normalize_filter``), each with
+# the kind of id it holds. ``companions`` holds integration domains, not registry ids.
+_PROFILE_ID_KEYS = (
+    ("areas", "areas", "area"),
+    ("exclude_areas", "areas", "area"),
+    ("labels", "labels", "label"),
+    ("exclude_labels", "labels", "label"),
+    ("devices", "devices", "device"),
+    ("exclude_devices", "devices", "device"),
+)
+
+
+def _missing_profile_ids(
+    section: str, raw: list[Any], known: RegistryIds
+) -> list[Problem]:
+    """1 warning for each profile filter list that names an id this install lacks."""
+    problems: list[Problem] = []
+    for index, profile in enumerate(raw):
+        filt = profile.get("filter") if isinstance(profile, dict) else None
+        if not isinstance(filt, dict):
+            continue
+        for key, kind, noun in _PROFILE_ID_KEYS:
+            ids = filt.get(key)
+            if not isinstance(ids, list):
+                continue
+            pool: Container[str] = getattr(known, kind)
+            missing = [
+                str(i) for i in ids if i not in (None, "") and str(i) not in pool
+            ]
+            if not missing:
+                continue
+            quoted = ", ".join(f'"{i}"' for i in missing)
+            subject = (
+                f"the {noun} {quoted} is"
+                if len(missing) == 1
+                else (f"the {noun}s {quoted} are")
+            )
+            problems.append(
+                Problem(
+                    section,
+                    index,
+                    f"{section}[{index}].filter.{key}",
+                    f"{subject} not on this install",
+                    "warning",
+                )
+            )
+    return problems
+
+
+def _repoint_profiles(raw: Any, ids: dict[str, str]) -> Any:
+    """The notifications section *raw*, with each ``profile_id`` in *ids* replaced."""
+    if not ids or not isinstance(raw, list):
+        return raw
+    return [
+        {**item, "profile_id": ids[item["profile_id"]]}
+        if isinstance(item, dict)
+        and isinstance(item.get("profile_id"), str)
+        and item["profile_id"] in ids
+        else item
+        for item in raw
+    ]
 
 
 def plan_settings(
@@ -593,25 +688,31 @@ def plan_settings(
     option_keys: Iterable[str],
     notify_services: Container[str],
     entity_ids: Container[str],
+    registry_ids: RegistryIds | None = None,
 ) -> SettingsPlan:
     """Plan a settings import from the settings *sections* of a document.
 
     *current* is the normalized options of this install, and *option_keys* is every
     option key. *notify_services* holds the ``notify`` service names, and
-    *entity_ids* holds the entity ids, of this install. A notify target or a to-do
-    list that this install does not have is a warning: the setting is imported, and
-    the user can fix it in the panel. A section with the wrong shape is an error.
+    *entity_ids* holds the entity ids, of this install. *registry_ids* holds its
+    area, label and device ids. With ``None``, the profile filter ids are not checked.
+    A notify target, a to-do list or a profile filter id that this install does not
+    have is a warning: the setting is imported, and the user can fix it in the panel.
+    A section with the wrong shape is an error.
     """
     profiles_key, notifications_key, options_key = SETTINGS_SECTIONS
     problems: list[Problem] = []
     updates: dict[str, Any] = {}
     counts: dict[str, Any] = {}
+    # A profile that matches by name keeps the stored id. Its notifications follow it.
+    profile_ids: dict[str, str] = {}
     if profiles_key in sections:
         merged, counts[profiles_key] = _upsert(
             profiles_key,
             sections[profiles_key],
             list(current.get(profiles_key) or []),
             problems,
+            profile_ids,
         )
         if merged is not None:
             updates[profiles_key] = merged
@@ -628,10 +729,16 @@ def plan_settings(
                             "warning",
                         )
                     )
+            if registry_ids is not None:
+                problems.extend(
+                    _missing_profile_ids(
+                        profiles_key, sections[profiles_key], registry_ids
+                    )
+                )
     if notifications_key in sections:
         merged, counts[notifications_key] = _upsert(
             notifications_key,
-            sections[notifications_key],
+            _repoint_profiles(sections[notifications_key], profile_ids),
             list(current.get(notifications_key) or []),
             problems,
         )
@@ -642,7 +749,20 @@ def plan_settings(
                 for position, target in enumerate(
                     targets if isinstance(targets, list) else []
                 ):
-                    if str(target) not in notify_services:
+                    # ``notifications.split_targets`` drops a target outside the
+                    # allowlist when the notification is stored.
+                    if not notifications.is_allowed_target(str(target)):
+                        problems.append(
+                            Problem(
+                                notifications_key,
+                                index,
+                                f"{notifications_key}[{index}].targets[{position}]",
+                                "Home Keeper does not send to the notify service "
+                                f'"notify.{target}", so it was not imported',
+                                "warning",
+                            )
+                        )
+                    elif str(target) not in notify_services:
                         problems.append(
                             Problem(
                                 notifications_key,
@@ -681,8 +801,20 @@ def plan_settings(
                         )
                     )
                     continue
+                if options.value_refused(key, value):
+                    problems.append(
+                        Problem(
+                            options_key,
+                            None,
+                            f"{options_key}.{key}",
+                            f'"{value}" is not a valid value of "{key}", so it was '
+                            "ignored",
+                            "warning",
+                        )
+                    )
+                    continue
                 updates[key] = value
-                if current.get(key) != value:
+                if current.get(key) != options.coerce_value(key, value):
                     changed += 1
             counts[options_key] = {"changed": changed}
             shopping = raw.get(OPTION_SHOPPING_LIST_ENTITY)
