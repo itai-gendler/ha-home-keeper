@@ -51,8 +51,9 @@ number of completions. Use these card editor options to control each row:
 A row shows 1 chip for the place. If the task has a device, the row shows the device chip.
 Else the row shows the area chip.
 
-For an admin, the device chip is a link. It opens the appliance page in Home Keeper if an
-appliance has the device. Else it opens the device page in Home Assistant.
+The device chip is a link. It opens the appliance page in Home Keeper if an appliance
+has the device. Else it opens the device page in Home Assistant. That page is only for
+an admin, so for other users that chip is not a link.
 
 ![Home Keeper card rows with device chips and 1 area chip](../../images/card-device-chip.png)
 
