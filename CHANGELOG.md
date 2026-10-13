@@ -6,6 +6,15 @@ All notable changes to Home Keeper are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses semantic
 versioning, with PEP 440 pre-release suffixes (`bN`/`aN`/`rcN`) for betas.
 
+## [Unreleased]
+
+### Fixed
+
+- **[Tasks of disabled entities](https://prestomation.github.io/ha-home-keeper/docs/guide/settings#declarative-companions-config-driven-no-separate-integration).**
+  Home Keeper now removes the declarative companion task of a disabled entity if the
+  task has no history. When you enable the entity again, Home Keeper adds a new task.
+  (Fixes #454)
+
 ## [0.31.0b4]
 
 ### Added
