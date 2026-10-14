@@ -59,7 +59,7 @@ Home Keeper works out when it is due, overdue or due soon.
 
 People complete, snooze and skip tasks in the Home Keeper panel, on the dashboard card, on the
 native to-do list and device pages, from actionable phone notifications and by scanning NFC tags.
-Every completion is kept with its note, cost, photo, reader and the person who did it. Appliances
+Every completion is kept with its note, cost, photo, reading and the person who did it. Appliances
 keep their make, model, serial number, documents, parts and spare stock; wear items become
 maintenance tasks and low stock becomes a buy reminder. Profiles are saved filters that drive
 notifications and to-do list syncs, and declarative companions turn matching Home Assistant
